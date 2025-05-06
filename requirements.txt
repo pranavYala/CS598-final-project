@@ -1,0 +1,7 @@
+torch>=1.9.0
+tqdm
+numpy
+pandas
+scikit-learn
+pyyaml
+google-cloud-storage
