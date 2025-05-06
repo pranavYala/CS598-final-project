@@ -5,3 +5,4 @@ pandas
 scikit-learn
 pyyaml
 google-cloud-storage
+pyhealth>=0.2.0
