@@ -1,6 +1,6 @@
 torch>=1.9.0
 tqdm
-numpy
+numpy>=1.18.0
 pandas
 scikit-learn
 pyyaml
