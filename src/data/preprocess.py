@@ -1,108 +1,177 @@
 import os
-import pandas as pd
 import numpy as np
-from pathlib import Path
-from sklearn.preprocessing import OneHotEncoder
-import sys
+import pandas as pd
+from datetime import datetime
+from transformers import BertTokenizer
 
-# ------------- CONFIGURATION -------------
-LAB_VITAL_BUCKETS = {
-    # example: map raw item IDs to bucket names
-    # 50820: 'Glucose', 50931: 'Glucose', …
+class Example:
+    def __init__(self, admission_id, text, labels=None):
+        self.admission_id = admission_id
+        self.text = text
+        self.labels = labels or {}
+
+def load_csv(table_name):
+    path = os.path.join('mimic-iii-clinical-database-demo-1.4',
+                        'mimic-iii-clinical-database-demo-1.4',
+                        f'{table_name}.csv')
+    print(f'Loading {table_name}...')
+    df = pd.read_csv(path)
+    if table_name == 'ADMISSIONS':
+        df['admittime'] = pd.to_datetime(df['admittime'])
+        df['dischtime'] = pd.to_datetime(df['dischtime'])
+    return df
+
+def aggregate_diagnoses(df_dx):
+    print('Aggregating diagnoses...')
+    agg = (
+        df_dx
+        .groupby('hadm_id')['icd9_code']
+        .agg(lambda codes: ' '.join(map(str, codes)))
+        .reset_index()
+        .rename(columns={'icd9_code': 'diagnoses_text'})
+    )
+    return agg
+
+def aggregate_chart(df_chart):
+    print('Aggregating chart events...')
+    numeric = df_chart[['hadm_id', 'valuenum']].dropna()
+    agg = (
+        numeric
+        .groupby('hadm_id')['valuenum']
+        .mean()
+        .reset_index()
+        .rename(columns={'valuenum': 'chart_mean_val'})
+    )
+    return agg
+
+def aggregate_labs(df_lab):
+    print('Aggregating lab events...')
+    numeric = df_lab[['hadm_id', 'valuenum']].dropna()
+    agg = (
+        numeric
+        .groupby('hadm_id')['valuenum']
+        .mean()
+        .reset_index()
+        .rename(columns={'valuenum': 'lab_mean_val'})
+    )
+    return agg
+
+def extract_timeseries(df_chart, df_adm, itemid, hours=24):
+    df_vital = df_chart[df_chart['itemid'] == itemid]
+    df_vital = df_vital[['hadm_id', 'charttime', 'valuenum']].dropna()
+    df_vital['charttime'] = pd.to_datetime(df_vital['charttime'])
+
+    ts_dict = {}
+    for hadm_id, adm_time in df_adm[['hadm_id', 'admittime']].values:
+        rows = df_vital[df_vital['hadm_id'] == hadm_id]
+        if rows.empty:
+            ts_dict[hadm_id] = [np.nan] * hours
+            continue
+        rows = rows.copy()
+        rows['hr_since_admit'] = (rows['charttime'] - adm_time).dt.total_seconds() / 3600
+        rows = rows[rows['hr_since_admit'].between(0, hours)]
+        rows['hr_hour'] = rows['hr_since_admit'].astype(int)
+        hourly = rows.groupby('hr_hour')['valuenum'].mean()
+        ts = [float(hourly.get(i, np.nan)) for i in range(hours)]
+        ts_dict[hadm_id] = ts
+    return ts_dict
+
+def fill_ts(ts, sentinel=-1):
+    ts = pd.Series(ts)
+    if ts.notna().any():
+        return ts.fillna(method='ffill').fillna(method='bfill').tolist()
+    else:
+        return [sentinel] * len(ts)
+
+weak_label_fns = {
+    'mortality': lambda r: int(r.get('hospital_expire_flag', 0)),
+    'long_los': lambda r: int((r['dischtime'] - r['admittime']).days >= 3)
 }
-TREATMENT_VARS = {
-    'ventilation': ['ventilator', 'respirator'],  # example keywords
-    'vasopressor': ['norepinephrine', 'epinephrine'],
-    'fluid_bolus': ['bolus']
-}
-STATIC_COLS = ['age', 'gender', 'ethnicity', 'insurance', 'admission_type', 'first_care_unit']
-OUTPUT_DIR = Path('data/processed')
-# -----------------------------------------
 
-def bucket_labs_vitals(df, bucket_map):
-    """Map raw lab/vital item IDs into named buckets."""
-    df['bucket'] = df['itemid'].map(bucket_map)
-    return df.dropna(subset=['bucket'])
+def build_examples(df, text_cols, weak_labels=None):
+    examples = []
+    for _, row in df.iterrows():
+        adm_id = row['hadm_id']
+        texts = [str(row.get(col, '')) for col in text_cols]
+        text = ' '.join([t for t in texts if t])
+        labels = {}
+        if weak_labels:
+            for name, fn in weak_labels.items():
+                labels[name] = fn(row)
+        examples.append(Example(adm_id, text, labels))
+    return examples
 
-def pivot_and_hourly(df, time_col='charttime', value_col='valuenum'):
-    """
-    Pivot to wide form by bucket, then resample to hourly bins.
-    """
-    df[time_col] = pd.to_datetime(df[time_col])
-    df = df.set_index(time_col)
-    wide = df.pivot_table(index='subject_id', columns='bucket', values=value_col, aggfunc='mean')
-    # Resample per ICU stay will be handled outside
-    return wide
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
-def extract_cohort_mimic(raw_dir, output_dir=OUTPUT_DIR):
-    """
-    1) Load ICU stays and filter: first ICU stay of adult patients.
-    2) Load labevents, chartevents; bucket & pivot.
-    3) Load inputevents_*; identify treatments.
-    4) Load patients/admissions for static features.
-    5) For each stay: merge timeseries, resample hourly, impute, save.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    # 1) ICU stays & patients
-    icustays = pd.read_csv(raw_dir / 'ICUSTAYS.csv')
-    patients = pd.read_csv(raw_dir / 'PATIENTS.csv')
-    admissions = pd.read_csv(raw_dir / 'ADMISSIONS.csv')
-    # filter adults and first ICU stay
-    stays = icustays.merge(patients[['subject_id','dob']], on='subject_id')
-    stays['age'] = (pd.to_datetime(stays['intime']) - pd.to_datetime(stays['dob'])).dt.days/365.25
-    stays = stays[stays['age']>=15].sort_values(['subject_id','intime']).drop_duplicates('subject_id')
-    # 2) Labs & vitals
-    labevents = pd.read_csv(raw_dir / 'LABEVENTS.csv')
-    chartevents = pd.read_csv(raw_dir / 'CHARTEVENTS.csv')
-    lv = pd.concat([labevents, chartevents], ignore_index=True)
-    lv = bucket_labs_vitals(lv, LAB_VITAL_BUCKETS)
-    # 3) Treatments
-    input_cv = pd.read_csv(raw_dir / 'INPUTEVENTS_CV.csv')
-    input_iv = pd.read_csv(raw_dir / 'INPUTEVENTS_MV.csv')
-    inputs = pd.concat([input_cv, input_iv], ignore_index=True)
-    # tag treatments by keywords
-    for trt, kws in TREATMENT_VARS.items():
-        inputs[trt] = inputs['itemid'].astype(str).str.contains('|'.join(kws), case=False)
-    # 4) Static
-    stat = admissions[['subject_id','insurance','admission_type']]\
-        .merge(patients[['subject_id','gender','ethnicity']], on='subject_id')
-    # 5) For each stay, build timeseries
-    for _, stay in stays.iterrows():
-        sid, intime, outtime = stay.subject_id, stay.intime, stay.outtime
-        mask = (lv.subject_id==sid) & (lv.charttime.between(intime, outtime))
-        df_lv = lv[mask].copy()
-        df_lv['charttime'] = pd.to_datetime(df_lv['charttime'])
-        df_lv = df_lv.set_index('charttime').groupby('bucket').resample('H')['valuenum'].mean().unstack(0)
-        # treatments
-        df_tr = inputs[inputs.subject_id==sid].copy()
-        df_tr['starttime'] = pd.to_datetime(df_tr['starttime'])
-        df_tr = df_tr.set_index('starttime')[list(TREATMENT_VARS)].resample('H').max().fillna(0)
-        # merge static features
-        row_static = stat[stat.subject_id==sid].iloc[0].to_dict()
-        df_static = pd.DataFrame([row_static]*len(df_lv), index=df_lv.index)
-        # full
-        df_full = pd.concat([df_lv, df_tr, df_static], axis=1).sort_index()
-        # impute missing: forward/backward fill then mean
-        df_full = df_full.ffill().bfill().fillna(df_full.mean())
-        # time-since-last-measured
-        ts = df_full.index.to_series().diff().fillna(pd.Timedelta(seconds=0)).dt.seconds / 3600
-        df_full['time_since_last'] = ts.cumsum()
-        # save
-        out_path = output_dir / f'mimic_cohort_{sid}.npz'
-        np.savez_compressed(out_path,
-                            data=df_full.iloc[:].values,
-                            columns=df_full.columns.values)
-    print("MIMIC preprocessing done.")
+def tokenize_examples(examples, max_length=128):
+    ids, input_ids_list, masks_list = [], [], []
+    for ex in examples:
+        enc = tokenizer.encode_plus(
+            ex.text,
+            add_special_tokens=True,
+            max_length=max_length,
+            truncation=True,
+            padding='max_length',
+            return_attention_mask=True
+        )
+        ids.append(ex.admission_id)
+        input_ids_list.append(enc['input_ids'])
+        masks_list.append(enc['attention_mask'])
+    return ids, input_ids_list, masks_list
 
-def extract_cohort_eicu(raw_dir, output_dir=OUTPUT_DIR):
-    """
-    Analogous pipeline for eICU (different table names, filtering).
-    """
-    # similar implementation for eICU-CRD
-    pass
+def main():
+    df_adm   = load_csv('ADMISSIONS')
+    df_dx    = load_csv('DIAGNOSES_ICD')
+    df_chart = load_csv('CHARTEVENTS')
+    df_lab   = load_csv('LABEVENTS')
 
-if __name__=='__main__':
-    raw = Path(sys.argv[1])
-    extract_cohort_mimic(raw)
-    # extract_cohort_eicu(raw)  # once you have eICU files
+    dx_agg    = aggregate_diagnoses(df_dx)
+    chart_agg = aggregate_chart(df_chart)
+    lab_agg   = aggregate_labs(df_lab)
 
+    print('Merging tables...')
+    df = df_adm.merge(dx_agg,    on='hadm_id', how='left')
+    df = df.merge(chart_agg, on='hadm_id', how='left')
+    df = df.merge(lab_agg,   on='hadm_id', how='left')
+
+    df['chart_mean_val'].fillna(df['chart_mean_val'].median(), inplace=True)
+    df['lab_mean_val'].fillna(df['lab_mean_val'].median(),     inplace=True)
+
+    ITEMID_HR = 211
+    ITEMID_SBP = 51
+    ITEMID_DBP = 8368
+
+    hr_ts_dict  = extract_timeseries(df_chart, df_adm, itemid=ITEMID_HR,  hours=24)
+    sbp_ts_dict = extract_timeseries(df_chart, df_adm, itemid=ITEMID_SBP, hours=24)
+    dbp_ts_dict = extract_timeseries(df_chart, df_adm, itemid=ITEMID_DBP, hours=24)
+
+    text_columns = ['diagnoses_text']
+    examples = build_examples(df, text_columns, weak_labels=weak_label_fns)
+    ids, input_ids, masks = tokenize_examples(examples, max_length=128)
+
+    out = pd.DataFrame({
+        'hadm_id': ids,
+        'input_ids': input_ids,
+        'attention_mask': masks,
+    })
+    for name in weak_label_fns:
+        out[name] = [ex.labels[name] for ex in examples]
+
+    df_indexed = df.set_index('hadm_id')
+    out['chart_mean_val'] = out['hadm_id'].map(df_indexed['chart_mean_val'])
+    out['lab_mean_val']   = out['hadm_id'].map(df_indexed['lab_mean_val'])
+
+    out['heart_rate_ts']  = out['hadm_id'].map(lambda hid: fill_ts(hr_ts_dict[hid]))
+    out['sbp_ts']         = out['hadm_id'].map(lambda hid: fill_ts(sbp_ts_dict[hid]))
+    out['dbp_ts']         = out['hadm_id'].map(lambda hid: fill_ts(dbp_ts_dict[hid]))
+
+    os.makedirs('preprocessed', exist_ok=True)
+    out_path = os.path.join('preprocessed', 'mimic_examples.parquet')
+    out.to_parquet(out_path, index=False)
+
+    print(f"Saved {len(out)} examples to {out_path}")
+    with open('mimic_examples_head.txt', 'w') as f:
+        f.write(out.head().to_string(index=False))
+
+if __name__ == '__main__':
+    main()
