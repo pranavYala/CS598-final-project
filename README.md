@@ -5,8 +5,7 @@ This repo reproduces **â€œA Comprehensive EHR Timeseries Pre-training Benchmarkâ
 # Setup
 
 **Install dependencies**  
-  ```bash
-   pip install -r requirements.txt
+pip install -r requirements.txt
 
 
 **Download Instructions for MIMIC-III (v1.4)**
