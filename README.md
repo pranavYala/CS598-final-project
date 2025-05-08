@@ -14,7 +14,7 @@ pip install -r requirements.txt
 3. Download the data using this command from the terminal (you will be prompted for your PhysioNet password):
 wget -r -N -c -np --user <user-name> --ask-password https://physionet.org/files/mimiciii/1.4/ 
 
-
+**To Produce the Model**
 1. **Preprocess and save MIMIC examples**:
 python data/preprocess.py
 
