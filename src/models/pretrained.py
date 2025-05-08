@@ -4,14 +4,15 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import pandas as pd
+import torch.nn.functional as F
 
-# --- Constants ---
-PREPROCESSED_DIR = '../data/preprocessed'
-EMBEDDING_FILE   = 'mimic_embeddings_with_timeseries.npy'
-PARQUET_FILE     = 'mimic_examples.parquet'
-MODEL_OUTPUT     = 'weak_pretrained_model.pt'
+# Constants
+preprocessed_dir = '../data/preprocessed'
+embedding_file   = 'mimic_embeddings_with_timeseries.npy'
+parquet     = 'mimic_examples.parquet'
+output_model     = 'weak_pretrained_model.pt'
 
-# --- Custom Dataset ---
+# Custom dataset
 class MimicPretrainDataset(Dataset):
     def __init__(self, embeddings, numeric_feats, time_series_feats, labels):
         self.embeddings        = embeddings
@@ -30,7 +31,7 @@ class MimicPretrainDataset(Dataset):
         los     = torch.tensor(self.labels['long_los'][idx])    # float32
         return emb, feats, ts_feats, mort, los
 
-# --- Simple Multi-task Model ---
+# simple multi-task model
 class WeakMultiTaskModel(nn.Module):
     def __init__(self, emb_dim, num_numeric_feats, num_time_series_feats):
         super().__init__()
@@ -45,12 +46,57 @@ class WeakMultiTaskModel(nn.Module):
         x      = torch.cat([emb, feats, ts_feats], dim=1)
         hidden = self.shared(x)
         return self.out_mort(hidden).squeeze(1), self.out_los(hidden).squeeze(1)
+    
+class MaskedImputationPretrainer(nn.Module):
+    # Encoder + decoder for masked imputation
 
-# --- Training Function ---
+    def __init__(self, encoder, mask_prob=0.15):
+        super().__init__()
+        self.encoder    = encoder
+        # decoder maps encoder.output_dim → input_dim (i.e. #features per time‐step)
+        self.decoder    = nn.Linear(encoder.output_dim, encoder.input_dim)
+        self.mask_prob  = mask_prob
+
+    def forward(self, x):
+        # x: [B, T•F] (flattened TS+static), or you can reshape inside encoder
+        mask = (torch.rand_like(x) < self.mask_prob).float()
+        x_masked = x * (1 - mask)
+        repr = self.encoder(x_masked)
+        pred = self.decoder(repr)
+        return pred, x, mask
+
+    def loss(self, forward_out):
+        pred, orig, mask = forward_out
+        # only penalize masked positions
+        if mask.sum() == 0:
+            return torch.tensor(0.0, device=pred.device)
+        return F.mse_loss(pred * mask, orig * mask)
+
+class MultiTaskPretrainer(nn.Module):
+    # Pretrained encoder + task heads
+
+    def __init__(self, encoder, task_heads: dict):
+        super().__init__()
+        self.encoder    = encoder
+        self.task_heads = nn.ModuleDict(task_heads)
+
+    def forward(self, x):
+        h = self.encoder(x)                          # [B, H]
+        return {t: head(h).squeeze(1) for t, head in self.task_heads.items()}
+
+    def loss(self, outs: dict, labels: dict, exclude_task=None):
+        total = 0.0
+        for t, pred in outs.items():
+            if t == exclude_task: continue
+            target = labels[t].to(pred.device)
+            total += F.binary_cross_entropy_with_logits(pred, target)
+        return total
+
+# Training function
 def train_weak_multitask_model():
     # Load embeddings + DataFrame
-    embeddings = np.load(os.path.join(PREPROCESSED_DIR, EMBEDDING_FILE)).astype(np.float32)
-    df = pd.read_parquet(os.path.join(PREPROCESSED_DIR, PARQUET_FILE))
+    embeddings = np.load(os.path.join(preprocessed_dir, embedding_file)).astype(np.float32)
+    df = pd.read_parquet(os.path.join(preprocessed_dir, parquet))
 
     # Numeric features
     numeric_feats = df[['chart_mean_val', 'lab_mean_val']].values.astype(np.float32)
@@ -114,7 +160,7 @@ def train_weak_multitask_model():
         print(f"Epoch {epoch:2d}/10 — Total Loss: {avg_loss:.4f} | Mort Loss: {avg_loss_mort:.4f} | LOS Loss: {avg_loss_los:.4f}")
 
     # Save model
-    out_path = os.path.join(PREPROCESSED_DIR, MODEL_OUTPUT)
+    out_path = os.path.join(preprocessed_dir, output_model)
     torch.save(model.state_dict(), out_path)
     print(f"Model saved to {out_path}")
 
