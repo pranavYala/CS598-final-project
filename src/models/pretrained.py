@@ -37,9 +37,9 @@ class WeakMultiTaskModel(nn.Module):
         super().__init__()
         self.shared = nn.Sequential(
             nn.Linear(emb_dim + num_numeric_feats + num_time_series_feats, 128),
-            nn.ReLU(),
-            nn.Dropout(p=0.5) 
+            nn.ReLU()
         )
+
         self.out_mort = nn.Linear(128, 1)
         self.out_los  = nn.Linear(128, 1)
 
@@ -128,10 +128,10 @@ def train_weak_multitask_model():
     model.to(device)
 
     loss_fn   = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5, weight_decay=1e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
 
     # Training loop
-    for epoch in range(1, 8):
+    for epoch in range(1, 11):
         model.train()
         total_loss = 0.0
         total_loss_mort = 0.0
