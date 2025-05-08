@@ -37,7 +37,8 @@ class WeakMultiTaskModel(nn.Module):
         super().__init__()
         self.shared = nn.Sequential(
             nn.Linear(emb_dim + num_numeric_feats + num_time_series_feats, 128),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.Dropout(p=0.5) 
         )
         self.out_mort = nn.Linear(128, 1)
         self.out_los  = nn.Linear(128, 1)
@@ -127,10 +128,10 @@ def train_weak_multitask_model():
     model.to(device)
 
     loss_fn   = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5, weight_decay=1e-5)
 
     # Training loop
-    for epoch in range(1, 11):
+    for epoch in range(1, 8):
         model.train()
         total_loss = 0.0
         total_loss_mort = 0.0
@@ -157,7 +158,7 @@ def train_weak_multitask_model():
         avg_loss      = total_loss / len(loader)
         avg_loss_mort = total_loss_mort / len(loader)
         avg_loss_los  = total_loss_los / len(loader)
-        print(f"Epoch {epoch:2d}/10 — Total Loss: {avg_loss:.4f} | Mort Loss: {avg_loss_mort:.4f} | LOS Loss: {avg_loss_los:.4f}")
+        print(f"Epoch {epoch:2d}/7 — Total Loss: {avg_loss:.4f} | Mort Loss: {avg_loss_mort:.4f} | LOS Loss: {avg_loss_los:.4f}")
 
     # Save model
     out_path = os.path.join(preprocessed_dir, output_model)
